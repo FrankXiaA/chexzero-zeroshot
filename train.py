@@ -64,6 +64,7 @@ class CXRDataset(data.Dataset):
         
         return sample
 
+
 def load_data(cxr_filepath, txt_filepath, batch_size=4, column='report', pretrained=False, verbose=False): 
     if torch.cuda.is_available():  
         dev = "cuda:0" 
@@ -109,53 +110,75 @@ def load_data(cxr_filepath, txt_filepath, batch_size=4, column='report', pretrai
     loader_params = {'batch_size':batch_size, 'shuffle': True, 'num_workers': 0}
     data_loader = data.DataLoader(torch_dset, **loader_params)
     return data_loader, device
-    
-def load_clip(model_path=None, pretrained=False, context_length=77):
+
+
+def load_clip(model_path=None, pretrained=False, context_length=77, lora_r=8):
     '''
     FUNCTION: load_clip
     -------------------------------
-    This function loads in a model with the CLIP model 
-    architecture. 
-    
-    args: 
-        * model_path (optional) - path to model weights that the model
-        will be initialized with 
-        * pretrained (optional) - if True, will load the pretrained 
-        CLIP model
-        * context_length (optional) - length of the maximum number of 
-        tokens that can be inputted into the CLIP model
+    This function loads a model with the CLIP architecture, optionally using LoRA.
+
+    args:
+        * model_path (optional) - path to model weights that the model will be initialized with
+        * pretrained (optional) - if True, will load the pretrained CLIP model
+        * context_length (optional) - length of the maximum number of tokens that can be inputted into the CLIP model
+        * lora_r (optional) - dimension for the low-rank approximation used in LoRA
     '''
 
     params = {
-        'embed_dim':768,
-        'image_resolution': 320,
-        'vision_layers': 12,
-        'vision_width': 768,
-        'vision_patch_size': 16,
-        'context_length': context_length,
-        'vocab_size': 49408,
-        'transformer_width': 512,
-        'transformer_heads': 8,
-        'transformer_layers': 12
+        'embed_dim': 768,  # Embedding dimension for both text and image features
+        'image_resolution': 384,  # Increased resolution for better feature extraction
+        'vision_layers': 12,  # Number of layers in the vision transformer
+        'vision_width': 768,  # Width of the vision transformer
+        'vision_patch_size': 16,  # Patch size for dividing images
+        'context_length': 77,  # Maximum token length for text input
+        'vocab_size': 49408,  # Vocabulary size for text embedding
+        'transformer_width': 512,  # Width of the text transformer
+        'transformer_heads': 8,  # Number of attention heads in the transformer
+        'transformer_layers': 12  # Number of layers in the text transformer
     }
-    
-    # set device 
+
+    # Set device
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    if pretrained: 
-        # load clip pre-trained model
+
+    if pretrained:
         model, preprocess = clip.load("ViT-B/32", device=device, jit=False)
-        print("Loaded in pretrained model.")
-    else: 
-        model = CLIP(**params)
-        print("Loaded in clip model.")
-    
-    # if a model_path is provided, load in weights to backbone
-    if model_path != None: 
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("Loaded pretrained CLIP model.")
+    else:
+        model = CLIP(**params, lora_r=lora_r)
+        print("Initialized new CLIP model with LoRA support.")
+
+    # Load model weights if a path is provided
+    if model_path is not None:
+        state_dict = torch.load(model_path, map_location=device)
+        model_state_dict = model.state_dict()
+
+        # Filter out mismatched or missing keys
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if k in model_state_dict and model_state_dict[k].shape == v.shape
+        }
+
+        # Load filtered weights
+        model.load_state_dict(filtered_state_dict, strict=False)
+        print(f"Loaded weights from {model_path} (partial match).")
+        # Resizing positional_embedding if necessary
+        if "visual.positional_embedding" in state_dict:
+            old_shape = state_dict["visual.positional_embedding"].shape
+            new_shape = model.visual.positional_embedding.shape
+            if old_shape != new_shape:
+                print(f"Resizing positional embedding from {old_shape} to {new_shape}.")
+                state_dict["visual.positional_embedding"] = torch.nn.functional.interpolate(
+                    state_dict["visual.positional_embedding"].unsqueeze(0).permute(0, 2, 1),
+                    size=new_shape[0],
+                    mode="linear",
+                ).squeeze(0).permute(1, 0)
+        if "visual.conv1.weight" in state_dict:
+            del state_dict["visual.conv1.weight"]
+            print("Reinitializing visual.conv1.weight due to size mismatch.")
     return model
-    
-    
+
+
 def preprocess_text(texts, model):
 #     if model.context_length is None: 
 #         model = model.module

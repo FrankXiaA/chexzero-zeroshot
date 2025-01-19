@@ -62,36 +62,43 @@ class CXRTestDataset(data.Dataset):
     
         return sample
 
-def load_clip(model_path, pretrained=False, context_length=77): 
-    """
-    FUNCTION: load_clip
-    ---------------------------------
-    """
-    device = torch.device("cpu")
-    if pretrained is False: 
-        # use new model params
-        params = {
-            'embed_dim':768,
-            'image_resolution': 320,
-            'vision_layers': 12,
-            'vision_width': 768,
-            'vision_patch_size': 16,
-            'context_length': context_length, 
-            'vocab_size': 49408,
-            'transformer_width': 512,
-            'transformer_heads': 8,
-            'transformer_layers': 12
-        }
+def load_clip(model_path, pretrained=False, context_length=77):
+    device = "cpu"
+    model = CLIP(
+        embed_dim=768,
+        image_resolution=384,
+        vision_layers=12,
+        vision_width=768,
+        vision_patch_size=16,
+        context_length=context_length,
+        vocab_size=49408,
+        transformer_width=512,
+        transformer_heads=8,
+        transformer_layers=12,
+        lora_r=8
+    )
+    model.to(device)
 
-        model = CLIP(**params)
-    else: 
-        model, preprocess = clip.load("ViT-B/32", device=device, jit=False) 
-    try: 
-        model.load_state_dict(torch.load(model_path, map_location=device))
-    except: 
-        print("Argument error. Set pretrained = True.", sys.exc_info()[0])
+    try:
+        state_dict = torch.load(model_path, map_location=device)
+
+        if "visual.positional_embedding" in state_dict:
+            old_shape = state_dict["visual.positional_embedding"].shape
+            new_shape = model.visual.positional_embedding.shape
+            if old_shape != new_shape:
+                state_dict["visual.positional_embedding"] = torch.nn.functional.interpolate(state_dict["visual.positional_embedding"].unsqueeze(0),size=new_shape[0],mode="linear",).squeeze(0)
+
+        if "visual.conv1.weight" in state_dict and state_dict["visual.conv1.weight"].shape != model.visual.conv1.weight.shape:
+            del state_dict["visual.conv1.weight"]
+
+        model.load_state_dict(state_dict, strict=False)
+        print(f"Model loaded successfully from {model_path}.")
+    except Exception as e:
+        print(f"Error loading model: {e}")
         raise
+
     return model
+
 
 def zeroshot_classifier(classnames, templates, model, context_length=77):
     """

@@ -196,7 +196,7 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, lora_r: int = 4):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
@@ -208,6 +208,12 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        self.lora = LoRALayer(d_model, lora_r)
+
+    def forward(self, x: torch.Tensor):
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.lora(self.mlp(self.ln_2(x)))
+        return x
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
@@ -231,7 +237,7 @@ class Transformer(nn.Module):
 
 
 class VisualTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, lora_r: int = 4):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
@@ -241,18 +247,29 @@ class VisualTransformer(nn.Module):
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
-
-        self.transformer = Transformer(width, layers, heads)
-
+        self.transformer = Transformer(width, layers, heads, attn_mask=None)
         self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.proj = LoRALayer(width, lora_r)
+
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        # Feature extraction
+        x = self.conv1(x)  # shape = [batch_size, width, grid_size, grid_size]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [batch_size, width, grid_size^2]
+        x = x.permute(0, 2, 1)  # shape = [batch_size, grid_size^2, width]
+
+        # Dynamically adjust positional embedding
+        pos_embed = self.positional_embedding
+        if pos_embed.shape[0] != x.shape[1]:
+            print(f"Resizing positional embedding from {pos_embed.shape[0]} to {x.shape[1]}.")
+            pos_embed = torch.nn.functional.interpolate(
+                pos_embed.unsqueeze(0).permute(0, 2, 1),  # Shape: [1, width, tokens]
+                size=x.shape[1],  # Match the token size
+                mode="linear"
+            ).squeeze(0).permute(1, 0)  # Shape back to [tokens, width]
+
+        # Add positional embedding
+        x = x + pos_embed.to(x.dtype)
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -262,7 +279,7 @@ class VisualTransformer(nn.Module):
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj
+            x = self.proj(x)
 
         return x
 
@@ -270,19 +287,18 @@ class VisualTransformer(nn.Module):
 class CLIP(nn.Module):
     def __init__(self,
                  embed_dim: int,
-                 # vision
                  image_resolution: int,
                  vision_layers: Union[Tuple[int, int, int, int], int],
                  vision_width: int,
                  vision_patch_size: int,
-                 # text
                  context_length: int,
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
-                 ):
+                 transformer_layers: int,
+                 lora_r: int = 4):
         super().__init__()
+
 
         self.context_length = context_length
 
@@ -293,7 +309,9 @@ class CLIP(nn.Module):
                 output_dim=embed_dim,
                 heads=vision_heads,
                 input_resolution=image_resolution,
-                width=vision_width
+                width=vision_width,
+                use_lora=True,
+                lora_r=lora_r
             )
         else:
             vision_heads = vision_width // 64
@@ -303,7 +321,8 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                lora_r=lora_r
             )
 
         self.transformer = Transformer(
@@ -318,9 +337,8 @@ class CLIP(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
+        self.text_projection = nn.Linear(transformer_width, embed_dim)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
         self.initialize_parameters()
 
     def initialize_parameters(self):
@@ -344,12 +362,14 @@ class CLIP(nn.Module):
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
         for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+            for layer in block.mlp:
+                # Skip LoRALayer initialization
+                if isinstance(layer, LoRALayer):
+                    continue
+                if hasattr(layer, 'weight'):
+                    nn.init.normal_(layer.weight, std=fc_std)
 
-        if self.text_projection is not None:
+        if self.text_projection is not None and isinstance(self.text_projection, nn.Parameter):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
@@ -368,34 +388,50 @@ class CLIP(nn.Module):
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
+        # Token embedding
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
+        # Add positional embedding
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
+
+        # Transformer layers
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
+
+        # Layer normalization
         x = self.ln_final(x).type(self.dtype)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        # Select the output corresponding to the end-of-text (eot) token
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)]  # [batch_size, transformer_width]
+
+        # Handle projection using LoRALayer or regular matrix multiplication
+        if isinstance(self.text_projection, nn.Module):
+            x = self.text_projection(x)  # Use the forward method of the module
+        else:
+            x = torch.matmul(x, self.text_projection)  # Perform matrix multiplication
 
         return x
 
     def forward(self, image, text):
+        # Encode image and text to get feature embeddings
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
 
-        # normalized features
+        # Normalize features
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logit_scale * text_features @ image_features.t()
+        # Ensure feature dimensions match
+        if image_features.shape[-1] != text_features.shape[-1]:
+            raise ValueError(
+                f"Feature dimension mismatch: image {image_features.shape[-1]}, text {text_features.shape[-1]}")
 
-        # shape = [global_batch_size, global_batch_size]
+        # Cosine similarity as logits
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * torch.matmul(image_features, text_features.t())
+        logits_per_text = logit_scale * torch.matmul(text_features, image_features.t())
+
         return logits_per_image, logits_per_text
 
 
